@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
+
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -17,6 +19,64 @@ from src.market_copilot.sentiment import SentimentAnalyzer, sentiment_negativity
 
 
 DEFAULT_CSV = Path("data/raw/Trading View (Mission 300cr) - 2025.csv")
+GOOGLE_SHEETS_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTBmX3WtsWtqU5mDtb2rudMx_PwRCbrSpALMzyqnjxzDRRhzIPC7ZlMjf7o7kPKVwMGMySMxLQecvPt/pub?output=csv"
+
+def ticker_from_sheet_label(label: object) -> str:
+    text = str(label).strip().upper()
+    if "RELIANCE" in text:
+        return "RELIANCE"
+    if "TATA" in text or text == "TCS":
+        return "TCS"
+    if "STATE BANK" in text or text == "SBIN":
+        return "SBIN"
+    if "SENSEX" in text:
+        return "SENSEX"
+    if "NIFTY" in text:
+        return "NIFTY"
+    if "NVIDIA" in text or "NVDA" in text:
+        return "NVIDIA"
+    if "APPLE" in text or "AAPL" in text:
+        return "AAPL"
+    if "NETFLIX" in text or "NFLX" in text:
+        return "NFLX"
+    return text.split("(")[0].strip().replace(" ", "_")
+
+
+def normalize_google_finance_sheet(sheet_df: pd.DataFrame) -> pd.DataFrame:
+    header_matches = sheet_df.apply(
+        lambda row: row.astype(str).str.strip().str.lower().eq("date").sum(), axis=1
+    )
+    header_row = int(header_matches.idxmax())
+    if header_matches.loc[header_row] == 0:
+        raise ValueError("Could not find the Google Finance header row in the published sheet.")
+
+    asset_row = max(0, header_row - 1)
+    date_columns = [
+        int(column_index)
+        for column_index, value in sheet_df.iloc[header_row].items()
+        if str(value).strip().lower() == "date"
+    ]
+
+    frames = []
+    for start in date_columns:
+        block = sheet_df.iloc[header_row + 1 :, start : start + 6].copy()
+        if block.shape[1] < 6:
+            continue
+        block.columns = ["Date", "Open", "High", "Low", "Close", "Volume"]
+        block = block.dropna(how="all")
+        block = block[block["Date"].notna()].copy()
+        if block.empty:
+            continue
+
+        ticker = ticker_from_sheet_label(sheet_df.iloc[asset_row, start])
+        block["Ticker"] = ticker
+        block["Date"] = pd.to_datetime(block["Date"], dayfirst=True, errors="coerce").dt.strftime("%Y-%m-%d")
+        frames.append(block)
+
+    if not frames:
+        raise ValueError("No ticker blocks were found in the published Google Sheet.")
+    return pd.concat(frames, ignore_index=True)
+
 
 
 st.set_page_config(
@@ -25,12 +85,24 @@ st.set_page_config(
 )
 
 
-@st.cache_data(show_spinner=False)
-def prepare_market_data(csv_path: str) -> pd.DataFrame:
-    raw = load_market_data(csv_path)
-    featured = engineer_features(raw)
-    return add_anomaly_scores(featured)
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_live_market_data() -> tuple[pd.DataFrame, str, datetime, str | None]:
+    try:
+        live_raw = pd.read_csv(GOOGLE_SHEETS_CSV_URL, header=None)
+        normalized_live = normalize_google_finance_sheet(live_raw)
+        temp_path = Path("data/raw/live_google_sheet_cache.csv")
+        normalized_live.to_csv(temp_path, index=False)
+        raw = load_market_data(temp_path)
+        source = "Google Sheets (Google Finance)"
+        warning = None
+    except Exception as exc:
+        raw = load_market_data(DEFAULT_CSV)
+        source = "Bundled CSV fallback"
+        warning = f"Google Sheets is temporarily unavailable, so the bundled CSV is being used. Details: {exc}"
 
+    featured = engineer_features(raw)
+    scored = add_anomaly_scores(featured)
+    return scored, source, datetime.now(), warning
 
 @st.cache_resource(show_spinner=False)
 def load_sentiment_analyzer() -> SentimentAnalyzer:
@@ -138,17 +210,42 @@ def analyze_news(ticker: str) -> pd.DataFrame:
 st.title("AI Market Intelligence Copilot")
 st.caption("Explainable technical, anomaly, news sentiment, event, and risk intelligence for mixed India and US market data.")
 
+try:
+    data, data_source, last_updated, data_warning = load_live_market_data()
+except Exception as exc:
+    st.error(f"Could not load market data from Google Sheets or the bundled fallback CSV: {exc}")
+    st.stop()
+
+if data_warning:
+    st.warning(data_warning)
+
+status_color = "#16a34a" if data_source.startswith("Google Sheets") else "#d97706"
+status_label = "LIVE MARKET DATA" if data_source.startswith("Google Sheets") else "FALLBACK DATA"
+assets_count = data["Ticker"].nunique() if "Ticker" in data.columns else 0
+max_date = data["Date"].max() if "Date" in data.columns else None
+range_end = "Present" if data_source.startswith("Google Sheets") else max_date.strftime("%d %b %Y")
+
+st.markdown(
+    f"""
+    <div style="border:1px solid #dbe7dd;border-radius:14px;padding:16px 18px;margin:12px 0 22px 0;background:linear-gradient(90deg,#f0fdf4,#ffffff);box-shadow:0 1px 3px rgba(15,23,42,0.06);">
+        <div style="display:flex;align-items:center;gap:10px;font-weight:800;font-size:18px;color:{status_color};">
+            <span style="height:11px;width:11px;border-radius:50%;background:{status_color};display:inline-block;"></span>
+            🟢 {status_label}
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:12px;color:#334155;font-size:14px;">
+            <div><strong>Source:</strong><br>{data_source}</div>
+            <div><strong>Last Updated:</strong><br>{last_updated.strftime('%d %b %Y, %I:%M %p')}</div>
+            <div><strong>Assets Monitored:</strong><br>{assets_count}</div>
+            <div><strong>Date Range:</strong><br>01 Jan 2024 &rarr; {range_end}</div>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
 with st.sidebar:
     st.header("Controls")
-    csv_path = DEFAULT_CSV
-    st.caption("Historical OHLCV dataset is integrated into this app.")
-    st.caption(f"Data source: `{csv_path}`")
-
-try:
-    data = prepare_market_data(str(csv_path))
-except Exception as exc:
-    st.error(f"Could not load market data: {exc}")
-    st.stop()
+    st.caption("Historical and newly updated market data load from Google Sheets automatically.")
 
 tickers = get_tickers(data)
 with st.sidebar:
@@ -225,6 +322,12 @@ with st.expander("Risk components"):
         [{"component": key, "normalized_value": round(value, 3)} for key, value in risk.components.items()]
     )
     st.dataframe(component_df, use_container_width=True, hide_index=True)
+
+
+
+
+
+
 
 
 
